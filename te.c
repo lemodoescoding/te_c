@@ -17,6 +17,7 @@
 #define CTRL_KEY(k) ((k) & 0x1f)
 
 #define KILO_VERSION "0.0.1"
+#define KILO_TAB_STOP 4
 
 enum editorKey {
   ARROW_LEFT = 1000,
@@ -33,11 +34,14 @@ enum editorKey {
 // --- Data ---
 typedef struct erow { // for storing size of the file and the chars in them
   int size;
+  int rsize; // size of the contents of render
   char *chars;
+  char *render; // contains actual character to draw on the screen
 } erow;
 
 struct editorConfig {
   int cx, cy;
+  int rx; // cx is for index for chars, rx for render field
   int rowoff;
   int coloff;
   int screenrows;
@@ -221,6 +225,54 @@ int getWindowSize(int *rows, int *cols) {
 }
 
 // --- ROW OPERATIONS ---
+
+int editorRowCxToRx(erow *row, int cx) {
+  // this to deal with movement of the cursor when it find a tab character
+  int rx = 0;
+
+  int j;
+  for (j = 0; j < cx; j++) {
+    if (row->chars[j] == '\t')
+      rx += (KILO_TAB_STOP - 1) -
+            (rx % KILO_TAB_STOP); // to find how many columns are to the right
+                                  // of the last tab stop
+
+    rx++;
+  }
+
+  return rx;
+}
+
+void editorUpdateRow(erow *row) {
+  int tabs = 0;
+  int j;
+  for (j = 0; j < row->size;
+       j++) { // counts how many tabs are there within a line
+    if (row->chars[j] == '\t')
+      tabs++;
+  }
+
+  free(row->render);
+
+  row->render = malloc(row->size + tabs * (KILO_TAB_STOP - 1) +
+                       1); // sets render size to acommodate tabs
+
+  int idx = 0; // contains the number of chars copied to row->render
+  for (j = 0; j < row->size; j++) {
+    if (row->chars[j] == '\t') { // when tabs are present
+      row->render[idx++] = ' ';
+      while ((idx % KILO_TAB_STOP) != 0) // iterate until gets to a tab stop,
+                                         // which is a column divisible by 8
+        row->render[idx++] = ' ';
+    } else {
+      row->render[idx++] = row->chars[j];
+    }
+  }
+
+  row->render[idx] = '\0';
+  row->rsize = idx;
+}
+
 void editorAppendRow(char *s, size_t len) {
   E.row = realloc(
       E.row,
@@ -233,6 +285,12 @@ void editorAppendRow(char *s, size_t len) {
 
   memcpy(E.row[at].chars, s, len);
   E.row[at].chars[len] = '\0';
+
+  E.row[at].rsize = 0;
+  E.row[at].render = NULL;
+
+  editorUpdateRow(&E.row[at]); // for rendering tabs
+
   E.numrows++;
 }
 
@@ -333,11 +391,24 @@ void editorProcessKeypress() {
     break;
 
   case END_KEY:
-    E.cx = E.screencols - 1;
+    if (E.cy < E.numrows)
+      E.cx = E.row[E.cy].size; // ensures to move to the end of the line defined
+                               // by the row cy size
     break;
 
   case PAGE_UP:
   case PAGE_DOWN: {
+
+    if (c ==
+        PAGE_UP) { // positions the cursor at the top or bottom of the screen
+      E.cy = E.rowoff;
+    } else if (c == PAGE_DOWN) {
+      E.cy = E.rowoff + E.screenrows - 1;
+
+      if (E.cy > E.numrows)
+        E.cy = E.numrows;
+    }
+
     int times = E.screenrows;
     while (times--)
       editorMoveCursor(c == PAGE_UP ? ARROW_UP : ARROW_DOWN);
@@ -385,6 +456,13 @@ void abFree(struct abuf *ab) {
 // --- OUTPUT ---
 
 void editorScroll() {
+  E.rx = 0;
+
+  if (E.cy < E.numrows) {
+    E.rx = editorRowCxToRx(&E.row[E.cy],
+                           E.cx); // calculates the right value for E.rx
+  }
+
   // to check if the cursor has moved outside of the visible window, and adjust
   // the cursor to be inside the visible window or terminal window
   if (E.cy < E.rowoff) {
@@ -398,12 +476,12 @@ void editorScroll() {
   }
 
   // for the horizontal part, pretty much the same as the vertical one above
-  if (E.cx < E.coloff) {
-    E.rowoff = E.cx;
+  if (E.rx < E.coloff) {
+    E.rowoff = E.rx;
   }
 
-  if (E.cx >= E.coloff + E.screencols) {
-    E.coloff = E.cx - E.screencols + 1;
+  if (E.rx >= E.coloff + E.screencols) {
+    E.coloff = E.rx - E.screencols + 1;
   }
 }
 
@@ -442,7 +520,7 @@ void editorDrawRows(struct abuf *ab) {
       }
     } else {
       int len =
-          E.row[filerow].size -
+          E.row[filerow].rsize -
           E.coloff; // draws the input text to the buffer ab on
                     // each line of erow, now coloff serve as an index of the
                     // chars each time each row is displayed to the screen
@@ -451,7 +529,7 @@ void editorDrawRows(struct abuf *ab) {
         len = 0;
       if (len > E.screencols)
         len = E.screencols;
-      abAppend(ab, &E.row[filerow].chars[E.coloff],
+      abAppend(ab, &E.row[filerow].render[E.coloff],
                len); // writes whatever in E.row.chars to the ab
     }
 
@@ -486,7 +564,7 @@ void editorRefreshScreen() {
   // window
   char buf[32];
   snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cy - E.rowoff) + 1,
-           (E.cx - E.coloff) + 1);
+           (E.rx - E.coloff) + 1);
   abAppend(&ab, buf, strlen(buf));
 
   abAppend(&ab, "\x1b[?25h", 6);
@@ -502,6 +580,8 @@ void initEditor() {
   // topmost of the screen
   E.cx = 0;
   E.cy = 0;
+
+  E.rx = 0;
 
   E.rowoff = 0; // set offset of scrolling to 0
   E.coloff = 0; // same as rowoff, it's now column
