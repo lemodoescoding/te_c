@@ -9,7 +9,20 @@
 #include <unistd.h>
 
 #define CTRL_KEY(k) ((k) & 0x1f)
-#define TE_VERSION "0.0.1"
+
+#define KILO_VERSION "0.0.1"
+
+enum editorKey {
+  ARROW_LEFT = 1000,
+  ARROW_RIGHT,
+  ARROW_UP,
+  ARROW_DOWN,
+  DEL_KEY,
+  HOME_KEY,
+  END_KEY,
+  PAGE_UP,
+  PAGE_DOWN
+};
 
 // --- Data ---
 struct editorConfig {
@@ -63,7 +76,7 @@ void enableRawMode() {
     die("tcsetattr"); // set the attr
 }
 
-char editorReadKey() {
+int editorReadKey() {
   int nread;
 
   char c;
@@ -74,7 +87,71 @@ char editorReadKey() {
       die("read");
   }
 
-  return c;
+  if (c ==
+      '\x1b') { // for detecting escape key sequences (arrow and other things)
+    char seq[3];
+
+    if (read(STDIN_FILENO, &seq[0], 1) != 1)
+      return '\x1b';
+    if (read(STDIN_FILENO, &seq[1], 1) != 1)
+      return '\x1b';
+
+    if (seq[0] == '[') { // checks if after the escape character is [ character
+      if (seq[1] >= '0' &&
+          seq[1] <= '9') { // options when the escape key seq is page_up or down
+                           // and home and end key
+        if (read(STDIN_FILENO, &seq[2], 1) != 1)
+          return '\x1b';
+
+        if (seq[2] == '~') { // detects for h/k or pu/pd
+          switch (seq[1]) {
+          case '1':
+            return HOME_KEY;
+          case '3':
+            return DEL_KEY; // delete key -> \x1b[3~
+          case '4':
+            return END_KEY;
+          case '5':
+            return PAGE_UP;
+          case '6':
+            return PAGE_DOWN;
+          case '7':
+            return HOME_KEY;
+          case '8':
+            return END_KEY;
+          }
+        }
+      } else { // options when the escape key seq is arrow
+        switch (seq[1]) {
+        case 'A':
+          return ARROW_UP;
+        case 'B':
+          return ARROW_DOWN;
+        case 'C':
+          return ARROW_RIGHT;
+        case 'D':
+          return ARROW_LEFT;
+        case 'H':
+          return HOME_KEY;
+        case 'F':
+          return END_KEY;
+        }
+      }
+    } else if (seq[0] == 'O') { // handles the home and end key, since different
+                                // os have different escape key seq
+      switch (seq[1]) {
+      case 'H':
+        return HOME_KEY;
+      case 'F':
+        return END_KEY;
+      }
+    }
+
+    return '\x1b';
+  } else {
+
+    return c;
+  }
 }
 
 int getCursorPosition(int *rows, int *cols) {
@@ -130,8 +207,32 @@ int getWindowSize(int *rows, int *cols) {
 
 // --- INPUT ---
 
+void editorMoveCursor(int key) {
+  // to move the cursor inside the terminal window, and also checks whether
+  // the cursor has reaches the end of each side of the window
+  switch (key) {
+  case ARROW_LEFT:
+    if (E.cx != 0)
+      E.cx--;
+    break;
+  case ARROW_RIGHT:
+    if (E.cx != E.screencols - 1)
+      E.cx++;
+    break;
+  case ARROW_UP:
+    if (E.cy != 0)
+      E.cy--;
+    break;
+  case ARROW_DOWN:
+    if (E.cy != E.screenrows - 1)
+      E.cy++;
+    break;
+  }
+}
+
 void editorProcessKeypress() {
-  char c = editorReadKey();
+  // handles what key is pressed
+  int c = editorReadKey();
 
   switch (c) {
   case CTRL_KEY('q'):
@@ -139,10 +240,36 @@ void editorProcessKeypress() {
     write(STDOUT_FILENO, "\x1b[H", 3);
     exit(0);
     break;
+
+  case HOME_KEY:
+    E.cx = 0;
+    break;
+
+  case END_KEY:
+    E.cx = E.screencols - 1;
+    break;
+
+  case PAGE_UP:
+  case PAGE_DOWN: {
+    int times = E.screenrows;
+    while (times--)
+      editorMoveCursor(c == PAGE_UP ? ARROW_UP : ARROW_DOWN);
+  } break;
+
+  case ARROW_DOWN: // for navigating or cursor movement
+  case ARROW_UP:
+  case ARROW_LEFT:
+  case ARROW_RIGHT:
+    editorMoveCursor(c);
+    break;
   }
 }
 
 // --- APPEND BUFFER ---
+// append buffer to reduce the consumption of write function
+// and also limitting bugs to occur when using write func
+// abuf is a dynamically string, C doesnt have this, we have to do it manually
+
 struct abuf {
   char *b;
   int len;
@@ -150,7 +277,9 @@ struct abuf {
 
 #define ABUF_INIT {NULL, 0}
 
-void abAppend(struct abuf *ab, const char *s, int len) {
+void abAppend(struct abuf *ab, const char *s,
+              int len) { // append the new string with is appropriate length to
+                         // be added to the abuf
   char *new = realloc(ab->b, ab->len + len);
 
   if (new == NULL)
@@ -161,7 +290,10 @@ void abAppend(struct abuf *ab, const char *s, int len) {
   ab->len += len;
 }
 
-void abFree(struct abuf *ab) { free(ab->b); }
+void abFree(struct abuf *ab) {
+  free(ab->b);
+} // dont forget to free the fucking memory used by the abuf, since it uses
+  // realloc
 
 // --- OUTPUT ---
 void editorDrawRows(struct abuf *ab) {
@@ -172,57 +304,57 @@ void editorDrawRows(struct abuf *ab) {
     // write(STDOUT_FILENO, "~", 1); // change this line
     if (y == E.screenrows / 3) {
       char welcome[80];
-
       int welcomelen = snprintf(welcome, sizeof(welcome),
-                                "TE editor -- version %s", TE_VERSION);
-      // this will truncate or reduce the welcome string len
-      // in case the terminal window is too small
+                                "TE editor -- version %s", KILO_VERSION);
       if (welcomelen > E.screencols)
         welcomelen = E.screencols;
 
-      int padding = (E.screencols - welcomelen) /
-                    2; // this is for centering the welcome text
+      int padding = (E.screencols - welcomelen) / 2;
+
       if (padding) {
-        abAppend(ab, "~", 1); // if padding is possible, print the tilde symbol
+        abAppend(ab, "~", 1);
         padding--;
       }
 
-      while (padding--) // and print space character until it goes to the middle
+      while (padding-- >= 0) { // makes the welcome screen text centered
         abAppend(ab, " ", 1);
+      }
 
-      abAppend(ab, welcome, welcomelen); // prints the welcome message
+      abAppend(ab, welcome, welcomelen); // prints the welcome screen text
     } else {
       abAppend(ab, "~", 1);
     }
 
-    abAppend(ab, "\x1b[K", 3); // erase current line
+    abAppend(ab, "\x1b[K", 3); // clean the remaining length of the line
 
     // the last line of the terminal screen seems not to print a tilde, this is
     // a bug on our code when it reaches the last line, it prints the \r\n and
     // causes the terminal to scroll in order to make room for the new blank
     // line
     if (y < E.screenrows - 1) {
-      /* write(STDOUT_FILENO, "\r\n", 2); */
       abAppend(ab, "\r\n", 2);
+      /* write(STDOUT_FILENO, "\r\n", 2); */
     }
   }
 }
 void editorRefreshScreen() {
   struct abuf ab = ABUF_INIT;
 
-  abAppend(&ab, "\x1b[?25l", 6); // l for set and hide the cursor
+  abAppend(&ab, "\x1b[?25l", 6);
+  /* abAppend(&ab, "\x1b[2J", 4); */
+  abAppend(&ab, "\x1b[H", 3);
 
   // write(STDOUT_FILENO, "\x1b[2J", 4); // clears the screen
-  // abAppend(&ab, "\x1b[2J", 4);
   // write(STDOUT_FILENO, "\x1b[H", 3);  // moves the cursor to the top
-  abAppend(&ab, "\x1b[H", 3);
 
   editorDrawRows(&ab);
 
   // write(STDOUT_FILENO, "\x1b[H", 3);
-  abAppend(&ab, "\x1b[H", 3);
+  char buf[32];
+  snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.cy + 1, E.cx + 1);
+  abAppend(&ab, buf, strlen(buf));
 
-  abAppend(&ab, "\x1b[?25h", 6); // h for reset and show the cursor
+  abAppend(&ab, "\x1b[?25h", 6);
 
   write(STDOUT_FILENO, ab.b, ab.len);
   abFree(&ab);
@@ -231,6 +363,8 @@ void editorRefreshScreen() {
 // --- INIT ---
 
 void initEditor() {
+  // sets the initial location of the cursor to be in (0,0) -> leftmost and
+  // topmost of the screen
   E.cx = 0;
   E.cy = 0;
 
