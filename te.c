@@ -9,9 +9,11 @@
 #include <unistd.h>
 
 #define CTRL_KEY(k) ((k) & 0x1f)
+#define TE_VERSION "0.0.1"
 
 // --- Data ---
 struct editorConfig {
+  int cx, cy;
   int screenrows;
   int screencols;
   struct termios orig_termios;
@@ -162,34 +164,76 @@ void abAppend(struct abuf *ab, const char *s, int len) {
 void abFree(struct abuf *ab) { free(ab->b); }
 
 // --- OUTPUT ---
-void editorDrawRows() {
+void editorDrawRows(struct abuf *ab) {
   int y;
   for (y = 0; y < E.screenrows;
        y++) { // E.screenrows will have the appropriate screen rows size after
               // succeeding get the values
-    write(STDOUT_FILENO, "~", 1); // change this line
+    // write(STDOUT_FILENO, "~", 1); // change this line
+    if (y == E.screenrows / 3) {
+      char welcome[80];
+
+      int welcomelen = snprintf(welcome, sizeof(welcome),
+                                "TE editor -- version %s", TE_VERSION);
+      // this will truncate or reduce the welcome string len
+      // in case the terminal window is too small
+      if (welcomelen > E.screencols)
+        welcomelen = E.screencols;
+
+      int padding = (E.screencols - welcomelen) /
+                    2; // this is for centering the welcome text
+      if (padding) {
+        abAppend(ab, "~", 1); // if padding is possible, print the tilde symbol
+        padding--;
+      }
+
+      while (padding--) // and print space character until it goes to the middle
+        abAppend(ab, " ", 1);
+
+      abAppend(ab, welcome, welcomelen); // prints the welcome message
+    } else {
+      abAppend(ab, "~", 1);
+    }
+
+    abAppend(ab, "\x1b[K", 3); // erase current line
 
     // the last line of the terminal screen seems not to print a tilde, this is
     // a bug on our code when it reaches the last line, it prints the \r\n and
     // causes the terminal to scroll in order to make room for the new blank
     // line
     if (y < E.screenrows - 1) {
-      write(STDOUT_FILENO, "\r\n", 2);
+      /* write(STDOUT_FILENO, "\r\n", 2); */
+      abAppend(ab, "\r\n", 2);
     }
   }
 }
 void editorRefreshScreen() {
-  write(STDOUT_FILENO, "\x1b[2J", 4); // clears the screen
-  write(STDOUT_FILENO, "\x1b[H", 3);  // moves the cursor to the top
+  struct abuf ab = ABUF_INIT;
 
-  editorDrawRows();
+  abAppend(&ab, "\x1b[?25l", 6); // l for set and hide the cursor
 
-  write(STDOUT_FILENO, "\x1b[H", 3);
+  // write(STDOUT_FILENO, "\x1b[2J", 4); // clears the screen
+  // abAppend(&ab, "\x1b[2J", 4);
+  // write(STDOUT_FILENO, "\x1b[H", 3);  // moves the cursor to the top
+  abAppend(&ab, "\x1b[H", 3);
+
+  editorDrawRows(&ab);
+
+  // write(STDOUT_FILENO, "\x1b[H", 3);
+  abAppend(&ab, "\x1b[H", 3);
+
+  abAppend(&ab, "\x1b[?25h", 6); // h for reset and show the cursor
+
+  write(STDOUT_FILENO, ab.b, ab.len);
+  abFree(&ab);
 }
 
 // --- INIT ---
 
 void initEditor() {
+  E.cx = 0;
+  E.cy = 0;
+
   if (getWindowSize(&E.screenrows, &E.screencols) == -1)
     die("getWindowSize");
 }
