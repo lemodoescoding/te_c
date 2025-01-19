@@ -11,6 +11,7 @@
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 #define CTRL_KEY(k) ((k) & 0x1f)
@@ -38,6 +39,7 @@ typedef struct erow { // for storing size of the file and the chars in them
 struct editorConfig {
   int cx, cy;
   int rowoff;
+  int coloff;
   int screenrows;
   int screencols;
   int numrows; //
@@ -268,16 +270,31 @@ void editorOpen(char *filename) {
 // --- INPUT ---
 
 void editorMoveCursor(int key) {
+  erow *row = (E.cy >= E.numrows) ? NULL : &E.row[E.cy];
+  // to know what is the len of current line
+
   // to move the cursor inside the terminal window, and also checks whether
   // the cursor has reaches the end of each side of the window
   switch (key) {
   case ARROW_LEFT:
     if (E.cx != 0)
       E.cx--;
+    else if (E.cy >
+             0) { // allow cursor when hit the left screen to continue upward
+      E.cy--;
+      E.cx = E.row[E.cy].size;
+    }
     break;
   case ARROW_RIGHT:
-    if (E.cx != E.screencols - 1)
+    if (row && E.cx < row->size) { // preventing user to able to move the cursor
+                                   // outside of the line
       E.cx++;
+    } else if (row &&
+               E.cx == row->size) { // makes the cursor put to the beginning of
+                                    // new line when reaches the end
+      E.cy++;
+      E.cx = 0;
+    }
     break;
   case ARROW_UP:
     if (E.cy != 0)
@@ -287,6 +304,16 @@ void editorMoveCursor(int key) {
     if (E.cy < E.numrows)
       E.cy++;
     break;
+  }
+
+  row = (E.cy >= E.numrows) ? NULL
+                            : &E.row[E.cy]; // the next line or previous line
+
+  int rowlen = row ? row->size : 0;
+
+  if (E.cx > rowlen) {
+    E.cx = rowlen; // forces the cursor to stay in the last character on each
+                   // line after doing cursor movement (up or down)
   }
 }
 
@@ -369,6 +396,15 @@ void editorScroll() {
     // checks if the cursor is past the bottom of the visible window
     E.rowoff = E.cy - E.screenrows + 1;
   }
+
+  // for the horizontal part, pretty much the same as the vertical one above
+  if (E.cx < E.coloff) {
+    E.rowoff = E.cx;
+  }
+
+  if (E.cx >= E.coloff + E.screencols) {
+    E.coloff = E.cx - E.screencols + 1;
+  }
 }
 
 void editorDrawRows(struct abuf *ab) {
@@ -405,11 +441,17 @@ void editorDrawRows(struct abuf *ab) {
         abAppend(ab, "~", 1);
       }
     } else {
-      int len = E.row[filerow].size; // draws the input text to the buffer ab on
-                                     // each line of erow
+      int len =
+          E.row[filerow].size -
+          E.coloff; // draws the input text to the buffer ab on
+                    // each line of erow, now coloff serve as an index of the
+                    // chars each time each row is displayed to the screen
+
+      if (len < 0)
+        len = 0;
       if (len > E.screencols)
         len = E.screencols;
-      abAppend(ab, E.row[filerow].chars,
+      abAppend(ab, &E.row[filerow].chars[E.coloff],
                len); // writes whatever in E.row.chars to the ab
     }
 
@@ -443,7 +485,8 @@ void editorRefreshScreen() {
   // E.cy now only refers the cursor position within the text file, not the
   // window
   char buf[32];
-  snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cy - E.rowoff) + 1, E.cx + 1);
+  snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cy - E.rowoff) + 1,
+           (E.cx - E.coloff) + 1);
   abAppend(&ab, buf, strlen(buf));
 
   abAppend(&ab, "\x1b[?25h", 6);
@@ -461,6 +504,7 @@ void initEditor() {
   E.cy = 0;
 
   E.rowoff = 0; // set offset of scrolling to 0
+  E.coloff = 0; // same as rowoff, it's now column
   E.numrows = 0;
   E.row = NULL;
 
