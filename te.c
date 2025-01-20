@@ -68,7 +68,7 @@ struct editorConfig E;
 
 void editorSetStatusMessage(const char *fmt, ...);
 void editorRefreshScreen();
-char *editorPrompt(char *prompt);
+char *editorPrompt(char *prompt, void (*callback)(char *, int));
 
 // --- TERMINAL ---
 
@@ -258,6 +258,24 @@ int editorRowCxToRx(erow *row, int cx) {
   }
 
   return rx;
+}
+
+int editorRowRxToCx(erow *row, int rx) {
+  int cur_rx = 0;
+  int cx;
+
+  // this is basically the inverse of editorRowCxToRx function
+
+  for (cx = 0; cx < row->size; cx++) {
+    if (row->chars[cx] == '\t') // handles when upon meets with tab char
+      cur_rx += (KILO_TAB_STOP - 1) - (cur_rx % KILO_TAB_STOP);
+    cur_rx++;
+
+    if (cur_rx > rx)
+      return cx;
+  }
+
+  return cx;
 }
 
 void editorUpdateRow(erow *row) {
@@ -510,7 +528,7 @@ void editorOpen(char *filename) {
 
 void editorSave() {
   if (E.filename == NULL) {
-    E.filename = editorPrompt("Save as: %s");
+    E.filename = editorPrompt("Save as: %s", NULL);
 
     if (E.filename == NULL) {
       editorSetStatusMessage("Save aborted");
@@ -563,9 +581,83 @@ void editorSave() {
                         // provided error code
 }
 
+// --- FIND ---
+
+void editorFindCallback(char *query, int key) {
+  static int last_match = -1;
+  static int direction = 1;
+
+  if (key == '\r' || key == '\x1b') {
+    last_match = -1;
+    direction = 1;
+    return;
+  } else if (key == ARROW_RIGHT || key == ARROW_DOWN) {
+    direction = 1;
+  } else if (key == ARROW_LEFT || key == ARROW_UP) {
+    direction = -1;
+  } else {
+    last_match = -1;
+    direction = 1;
+  }
+
+  if (last_match == -1)
+    direction = 1;
+
+  int current =
+      last_match; // current is the index of the current row we are searching
+  // if there was a last match, it starts on the line after,
+  // if there isnt is starts at the top of the file
+
+  int i;
+  for (i = 0; i < E.numrows; i++) {
+    current += direction;
+    if (current == -1)
+      current = E.numrows - 1; // causes current to go from the end of the file
+                               // back to the beginning
+    else if (current == E.numrows)
+      current = 0;
+
+    erow *row = &E.row[current];
+
+    char *match = strstr(row->render, query);
+    // query search using strstr function
+    // the rest is self-explanatory code
+
+    if (match) {
+      last_match = current; // updates last_match to current
+      E.cy = current;
+      E.cx = editorRowRxToCx(
+          row,
+          match - row->render); // converts the rx to cx, since cx is referring
+                                // to the position of char, not on the screen
+      E.rowoff = E.numrows;
+      break;
+    }
+  }
+}
+
+void editorFind() {
+  int saved_cx = E.cx;
+  int saved_cy = E.cy;
+  int saved_coloff = E.coloff;
+  int saved_rowoff = E.rowoff;
+
+  char *query =
+      editorPrompt("Search: %s (Use ESC/Arrows/Enter)", editorFindCallback);
+
+  if (query)
+    free(query);
+  else {
+    E.cx = saved_cx;
+    E.cy = saved_cy;
+    E.coloff = saved_coloff;
+    E.rowoff = saved_rowoff;
+  }
+}
+
 // --- INPUT ---
 
-char *editorPrompt(char *prompt) {
+char *editorPrompt(char *prompt, void (*callback)(char *, int)) {
   // prompt is expected to be a format string containing a %s user input
   size_t bufsize = 128;        // user input will be stored in this buf
   char *buf = malloc(bufsize); // here on buf
@@ -581,13 +673,18 @@ char *editorPrompt(char *prompt) {
     int c = editorReadKey(); // read the key user press after
     if (c == '\x1b') {
       editorSetStatusMessage("");
-      free(buf);
+      if (callback)
+        callback(buf, c);
 
+      free(buf);
       return NULL;
     } else if (c ==
                '\r') { // if the key pressed is enter, clear the status message
       if (buflen != 0) { // and if the buf is not empty
         editorSetStatusMessage("");
+        if (callback)
+          callback(buf, c);
+
         return buf;
       }
     } else if (!iscntrl(c) && c < 128) { // if c is not a control or special key
@@ -605,6 +702,9 @@ char *editorPrompt(char *prompt) {
       if (buflen != 0)
         buf[--buflen] = '\0';
     }
+
+    if (callback)
+      callback(buf, c);
   }
 }
 
@@ -698,6 +798,10 @@ void editorProcessKeypress() {
     if (E.cy < E.numrows)
       E.cx = E.row[E.cy].size; // ensures to move to the end of the line defined
                                // by the row cy size
+    break;
+
+  case CTRL_KEY('f'):
+    editorFind();
     break;
 
   case BACKSPACE:
@@ -989,7 +1093,8 @@ int main(int argc, char *argv[]) {
     editorOpen(argv[1]);
   }
 
-  editorSetStatusMessage("HELP: Ctrl-Q to quit | Ctrl-S to save");
+  editorSetStatusMessage(
+      "HELP: Ctrl-Q to quit | Ctrl-S to save | Ctrl-F to find");
 
   while (1) {
     editorRefreshScreen();
