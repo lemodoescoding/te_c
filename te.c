@@ -5,6 +5,7 @@
 #include <asm-generic/ioctls.h>
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,12 +16,16 @@
 #include <time.h>
 #include <unistd.h>
 
+// --- DEFINES ---
+
 #define CTRL_KEY(k) ((k) & 0x1f)
 
 #define KILO_VERSION "0.0.1"
 #define KILO_TAB_STOP 4
+#define KILO_QUIT_TIMES 3
 
 enum editorKey {
+  BACKSPACE = 127,
   ARROW_LEFT = 1000,
   ARROW_RIGHT,
   ARROW_UP,
@@ -47,8 +52,10 @@ struct editorConfig {
   int coloff;
   int screenrows;
   int screencols;
-  int numrows;    //
-  erow *row;      // store multiple erow structs
+  int numrows; //
+  erow *row;   // store multiple erow structs
+  int dirty;   // to know if the current buffer is already changed and saved to
+               // disk
   char *filename; // stores the filename being loaded
   char statusmsg[80];
   time_t statusmsg_time;
@@ -56,6 +63,10 @@ struct editorConfig {
 };
 
 struct editorConfig E;
+
+// --- PROTOTYPES ---
+
+void editorSetStatusMessage(const char *fmt, ...);
 
 // --- TERMINAL ---
 
@@ -296,9 +307,139 @@ void editorAppendRow(char *s, size_t len) {
   editorUpdateRow(&E.row[at]); // for rendering tabs
 
   E.numrows++;
+  E.dirty++; // increase the dirty value
+}
+
+void editorFreeRow(erow *row) {
+  free(row->render); // free the memory by the row we want to delete
+  free(row->chars);
+}
+
+void editorDelRow(int at) {
+  if (at < 0 || at >= E.numrows)
+    return; // validate the index if it's valid to delete
+
+  editorFreeRow(&E.row[at]);
+  memmove(
+      &E.row[at], &E.row[at + 1],
+      sizeof(erow) *
+          (E.numrows - at -
+           1)); // overwrite the deleted row struct with the rest of the rows
+
+  E.numrows--;
+  E.dirty++;
+}
+
+void editorRowInsertChar(erow *row, int at, int c) {
+  if (at < 0 || at > row->size)
+    at = row->size; // at is the index we want to insert the character
+  // at can go beyond 0 or beyond the row len limit
+
+  row->chars =
+      realloc(row->chars,
+              row->size + 2); // allocate 2 byte for the new char and null byte
+  memmove(&row->chars[at + 1], &row->chars[at],
+          row->size - at + 1); // make new room for the new chars
+  row->size++;                 // this is self-explanatory
+
+  row->chars[at] = c;   // assign the char on the appropriate position -> at
+  editorUpdateRow(row); // -> update the row with the new content
+
+  E.dirty++;
+}
+
+void editorRowAppendString(erow *row, char *s, size_t len) {
+  row->chars = realloc(
+      row->chars,
+      row->size + len +
+          1); // reallocate the new size of the row, + 1 is for the null byte
+
+  memcpy(&row->chars[row->size], s, len); // copy the memory
+
+  row->size += len; // update the row size by len
+  row->chars[row->size] = '\0';
+
+  editorUpdateRow(row);
+
+  E.dirty++;
+}
+
+void editorRowDelChar(erow *row, int at) {
+  if (at < 0 || at >= row->size)
+    return;
+
+  memmove(&row->chars[at], &row->chars[at + 1],
+          row->size - at); // memmove to overwrite the deleted character with
+                           // the characters that come after it
+  row->size--;
+
+  editorUpdateRow(row);
+  E.dirty++;
+}
+
+// --- EDITOR OPERATIOS ---
+
+void editorInsertChar(int c) {
+  if (E.cy == E.numrows) { // when the cursor is on the very bottom
+    editorAppendRow("",
+                    0); // append a new row on there before inserting anything
+  }
+
+  editorRowInsertChar(&E.row[E.cy], E.cx, c); // insert the char
+  E.cx++;
+}
+
+void editorDelChar() {
+  if (E.cy == E.numrows)
+    return; // if the cursor are past the the end of the file, nothing to be
+            // deleted
+
+  if (E.cx == 0 && E.cy == 0)
+    return;
+
+  erow *row = &E.row[E.cy]; // grab the pointer of the current row erow
+
+  if (E.cx > 0) {
+    editorRowDelChar(
+        row, E.cx - 1); // deletes one character and moves the cursor back by 1
+    E.cx--;
+  } else {
+    E.cx = E.row[E.cy - 1].size;
+    editorRowAppendString(&E.row[E.cy - 1], row->chars,
+                          row->size); // append the string on the current line
+                                      // or row to the previous
+    editorDelRow(E.cy);               // deletes the current row / line
+
+    E.cy--;
+  }
 }
 
 // --- FILE I/O ---
+
+void *editorRowsToString(int *buflen) {
+  int totlen = 0; // store the total length of the entire text
+  int j;
+
+  for (j = 0; j < E.numrows; j++) {
+    totlen += E.row[j].size + 1; // adding one to each line for return char
+  }
+
+  *buflen = totlen;
+
+  char *buf = malloc(totlen); // allocate the required memory
+  char *p = buf;              // pointer to buf
+
+  for (j = 0; j < E.numrows; j++) {
+    memcpy(p, E.row[j].chars,
+           E.row[j].size); // copy the entire line to the p -> buf
+    p += E.row[j].size;    // move the pointer in size with the row
+    *p = '\n';             // add return char at the end
+    p++;                   // move the pointer by 1
+  }
+
+  return buf; // returns the pointer of buf, expected to free the memory by the
+              // caller
+}
 
 void editorOpen(char *filename) {
   free(E.filename);
@@ -331,6 +472,57 @@ void editorOpen(char *filename) {
 
   free(line);
   fclose(fp);
+
+  E.dirty = 0; // sets E.dirty to 0 after opening a file
+}
+
+void editorSave() {
+  if (E.filename == NULL)
+    return;
+
+  int len;
+  char *buf = editorRowsToString(&len);
+
+  int fd = open(E.filename, O_RDWR | O_CREAT,
+                0644); // create the file based on the name of the filename
+  // O_RDWR -> reading and writing
+  // O_CREAT -> create new file if it doesnt already exist, 0644 is the argument
+  // for fie permission, just like the chmod file/dir permission
+
+  if (fd != -1) {
+    if (ftruncate(fd, len) != -1) {
+      // sets the file size to len, and also truncate any data
+      // that is larger than len
+      // the normal way to overwrite a file is to pass O_TRUNC flag to open()
+      // func
+      // -> trucates the file completely truncating the file len first is
+      // actually safer, since if the write operation below us fails, we still
+      // have the remaining data until the new len, so we don't actually lose
+      // all the stuff.
+      //
+      // most advanced editors will write to a new temp file, then rename the
+      // file to the actual file that user wants to overwrite, and then
+      // carefully check for errors through the whole process
+
+      if (write(fd, buf, len) == len) {
+        close(fd);
+        free(buf);
+
+        E.dirty = 0; // sets the dirty value to 0 after saving the file
+
+        editorSetStatusMessage("%d bytes written to disk",
+                               len); // send message to messagebuf
+        return;
+      } // write the bytes
+    }
+    close(fd); // close the open
+  }
+
+  free(buf);
+  editorSetStatusMessage(
+      "Can't save! I/O error: %s",
+      strerror(errno)); // strerror returns the human readable string for the
+                        // provided error code
 }
 
 // --- INPUT ---
@@ -387,11 +579,33 @@ void editorProcessKeypress() {
   // handles what key is pressed
   int c = editorReadKey();
 
+  static int quit_times =
+      KILO_QUIT_TIMES; // keep track how many Ctrl-Q has been pressed
+
   switch (c) {
+  case '\r':
+    // TODO
+    break;
+
   case CTRL_KEY('q'):
+
+    if (E.dirty && quit_times > 0) {
+      editorSetStatusMessage("WARNING!!! File has unsaved changes. "
+                             "Press Ctrl-Q %d more times to quit.",
+                             quit_times);
+      quit_times--;
+
+      return;
+    }
+
     write(STDOUT_FILENO, "\x1b[2J", 4);
     write(STDOUT_FILENO, "\x1b[H", 3);
     exit(0);
+    break;
+
+  case CTRL_KEY('s'):
+
+    editorSave();
     break;
 
   case HOME_KEY:
@@ -402,6 +616,16 @@ void editorProcessKeypress() {
     if (E.cy < E.numrows)
       E.cx = E.row[E.cy].size; // ensures to move to the end of the line defined
                                // by the row cy size
+    break;
+
+  case BACKSPACE:
+  case CTRL_KEY('h'):
+  case DEL_KEY:
+    if (c == DEL_KEY) // when the pressed key is DEL_KEY, move the cursor to the
+                      // right by 1
+      editorMoveCursor(ARROW_RIGHT);
+
+    editorDelChar();
     break;
 
   case PAGE_UP:
@@ -427,6 +651,14 @@ void editorProcessKeypress() {
   case ARROW_LEFT:
   case ARROW_RIGHT:
     editorMoveCursor(c);
+    break;
+
+  case CTRL_KEY('l'):
+  case '\x1b':
+    break;
+
+  default:
+    editorInsertChar(c); // insert the new char to the row
     break;
   }
 }
@@ -559,8 +791,9 @@ void editorDrawStatusBar(struct abuf *ab) {
   char status[80];
   char rstatus[80];
 
-  int len = snprintf(status, sizeof(status), "%.20s - %d lines",
-                     E.filename ? E.filename : "[No Name]", E.numrows);
+  int len = snprintf(status, sizeof(status), "%.20s - %d lines %s",
+                     E.filename ? E.filename : "[No Name]", E.numrows,
+                     E.dirty ? "(modified)" : "");
   int rlen = snprintf(rstatus, sizeof(rstatus), "%d,%d", E.cy + 1, E.rx + 1);
 
   if (len > E.screencols)
@@ -651,6 +884,8 @@ void initEditor() {
   E.numrows = 0;
   E.row = NULL;
 
+  E.dirty = 0;
+
   E.filename = NULL;
   E.statusmsg[0] = '\0';
   E.statusmsg_time = 0;
@@ -670,7 +905,7 @@ int main(int argc, char *argv[]) {
     editorOpen(argv[1]);
   }
 
-  editorSetStatusMessage("HELP: Ctrl-Q to quit");
+  editorSetStatusMessage("HELP: Ctrl-Q to quit | Ctrl-S to save");
 
   while (1) {
     editorRefreshScreen();
