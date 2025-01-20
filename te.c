@@ -24,6 +24,9 @@
 #define KILO_TAB_STOP 4
 #define KILO_QUIT_TIMES 3
 
+#define HL_HIGHLIGHT_NUMBERS (1 << 0)
+#define HL_HIGHLIGHT_STRINGS (1 << 1)
+
 enum editorKey {
   BACKSPACE = 127,
   ARROW_LEFT = 1000,
@@ -37,9 +40,16 @@ enum editorKey {
   PAGE_DOWN
 };
 
-enum editorHighlight { HL_NORMAL = 0, HL_NUMBER, HL_MATCH };
+enum editorHighlight { HL_NORMAL = 0, HL_STRING, HL_NUMBER, HL_MATCH };
 
 // --- Data ---
+
+struct editorSyntax {
+  char *filetype;
+  char **filematch;
+  int flags;
+};
+
 typedef struct erow { // for storing size of the file and the chars in them
   int size;
   int rsize; // size of the contents of render
@@ -62,10 +72,20 @@ struct editorConfig {
   char *filename; // stores the filename being loaded
   char statusmsg[80];
   time_t statusmsg_time;
+  struct editorSyntax *syntax;
   struct termios orig_termios;
 };
 
 struct editorConfig E;
+
+// --- FILETYPES ---
+char *C_HL_extensions[] = {".c", ".h", ".cpp", NULL};
+
+// HLDB -> highlight db
+struct editorSyntax HLDB[] = {
+    {"c", C_HL_extensions, HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS}};
+
+#define HLDB_ENTRIES (sizeof(HLDB) / sizeof(HLDB[0]))
 
 // --- PROTOTYPES ---
 
@@ -256,8 +276,14 @@ void editorUpdateSyntax(erow *row) {
   memset(row->hl, HL_NORMAL,
          row->rsize); // set all character to be HL_NORMAL by default
 
+  if (E.syntax == NULL) // if no filetype is set, return immediately
+                        // by this point, the entire line is set to HL_NORMAL
+    return;
+
   int prev_sep = 1; // previous_separator, defaults to 1 -> true,
   // consider the beginning of the line to be a separator
+
+  int in_string = 0; // tracks if the current syntax is in string or not
 
   int i = 0;
   while (i < row->rsize) {
@@ -266,21 +292,60 @@ void editorUpdateSyntax(erow *row) {
     unsigned char prev_hl = (i > 0) ? row->hl[i - 1] : HL_NORMAL;
     // prev_hl set to the hl type of the previous character
 
-    if ((isdigit(row->render[i]) && (prev_sep || prev_hl == HL_NUMBER)) ||
-        (c == '.' && prev_hl == HL_NUMBER)) {
-      // to highlight a digit, it is now required that the previous character
-      // needs to be either separator or HL_NUMBER
-      //
-      // additional conditining to highlight decimal point aswell if it is
-      // between a number
+    if (E.syntax->flags & HL_HIGHLIGHT_STRINGS) {
+      // checks if the flags is also set to highlight string
+      if (in_string) {
+        // if current char is in string, then hl[i] = HL_STRING
+        row->hl[i] = HL_STRING;
 
-      row->hl[i] = HL_NUMBER; // set the hl to be a number
-      i++;                    // moves to the next character
+        if (c == '\\' && i + 1 < row->rsize) {
+          // checks the occurance of \' and \"
+          row->hl[i + 1] = HL_STRING;
+          i += 2;
 
-      prev_sep = 0; // set this to 0, to indicate we are in the middle of
-                    // highlighting something,
-      // and continue the loop
-      continue;
+          // skip the 2 chars and continue to the index += 2
+          continue;
+        }
+
+        if (c == in_string)
+          in_string = 0; // if current char c is the same as the beginning of
+                         // the string, set in_string = 0
+        i++;
+
+        prev_sep = 1;
+        continue;
+      } else {
+        if (c == '"' ||
+            c == '\'') { // checks if current char is dbl-quote or sngl-quot
+          in_string = c;
+
+          // set in_string to c;
+          // and HL_STRING current hl[i]
+          row->hl[i] = HL_STRING;
+
+          i++;
+          continue;
+        }
+      }
+    }
+
+    if (E.syntax->flags & HL_HIGHLIGHT_NUMBERS) {
+      if ((isdigit(row->render[i]) && (prev_sep || prev_hl == HL_NUMBER)) ||
+          (c == '.' && prev_hl == HL_NUMBER)) {
+        // to highlight a digit, it is now required that the previous character
+        // needs to be either separator or HL_NUMBER
+        //
+        // additional conditining to highlight decimal point aswell if it is
+        // between a number
+
+        row->hl[i] = HL_NUMBER; // set the hl to be a number
+        i++;                    // moves to the next character
+
+        prev_sep = 0; // set this to 0, to indicate we are in the middle of
+                      // highlighting something,
+        // and continue the loop
+        continue;
+      }
     }
 
     // if the current character is not highlighted, then set prev_sep
@@ -293,12 +358,51 @@ void editorUpdateSyntax(erow *row) {
 
 int editorSyntaxToColor(int hl) {
   switch (hl) {
+  case HL_STRING:
+    return 35; // magenta
   case HL_NUMBER:
     return 31;
   case HL_MATCH:
     return 34;
   default:
     return 37;
+  }
+}
+
+void editorSelectSyntaxHighlight() {
+  E.syntax = NULL;
+
+  if (E.filename == NULL)
+    return;
+
+  char *ext =
+      strrchr(E.filename, '.'); // locates the last occurance of char . in the
+                                // filename if no ext returns NULL
+
+  for (unsigned int j = 0; j < HLDB_ENTRIES; j++) {
+    // try to match what is the syntax on the HLDB
+    struct editorSyntax *s = &HLDB[j];
+
+    unsigned int i = 0;
+    while (s->filematch[i]) {
+      int is_ext = (s->filematch[i][0] == '.');
+
+      // if the pattern starts with . then it is a file ext pattern
+      if ((is_ext && ext && !strcmp(ext, s->filematch[i])) ||
+          (!is_ext && strstr(E.filename, s->filematch[i]))) {
+        // compare the ext and the filematch[i]
+        E.syntax = s;
+
+        // this for rehighlighting the entire line after setting E.syntax
+        int filerow;
+        for (filerow = 0; filerow < E.numrows; filerow++) {
+          editorUpdateSyntax(&E.row[filerow]);
+        }
+        return;
+      }
+
+      i++;
+    }
   }
 }
 
@@ -558,7 +662,9 @@ void *editorRowsToString(int *buflen) {
 void editorOpen(char *filename) {
   free(E.filename);
 
-  E.filename = strdup(filename);
+  E.filename = strdup(filename); // duplicates filename to E.filename
+
+  editorSelectSyntaxHighlight();
 
   FILE *fp = fopen(
       filename,
@@ -598,6 +704,8 @@ void editorSave() {
       editorSetStatusMessage("Save aborted");
       return;
     }
+
+    editorSelectSyntaxHighlight();
   }
 
   int len;
@@ -1095,7 +1203,10 @@ void editorDrawStatusBar(struct abuf *ab) {
   int len = snprintf(status, sizeof(status), "%.20s - %d lines %s",
                      E.filename ? E.filename : "[No Name]", E.numrows,
                      E.dirty ? "(modified)" : "");
-  int rlen = snprintf(rstatus, sizeof(rstatus), "%d,%d", E.cy + 1, E.rx + 1);
+
+  int rlen =
+      snprintf(rstatus, sizeof(rstatus), "%s | %d,%d",
+               E.syntax ? E.syntax->filetype : "no ft", E.cy + 1, E.rx + 1);
 
   if (len > E.screencols)
     len = E.screencols - 1;
@@ -1190,6 +1301,8 @@ void initEditor() {
   E.filename = NULL;
   E.statusmsg[0] = '\0';
   E.statusmsg_time = 0;
+
+  E.syntax = NULL;
 
   if (getWindowSize(&E.screenrows, &E.screencols) == -1)
     die("getWindowSize");
