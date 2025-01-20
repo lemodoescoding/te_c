@@ -67,6 +67,8 @@ struct editorConfig E;
 // --- PROTOTYPES ---
 
 void editorSetStatusMessage(const char *fmt, ...);
+void editorRefreshScreen();
+char *editorPrompt(char *prompt);
 
 // --- TERMINAL ---
 
@@ -507,8 +509,14 @@ void editorOpen(char *filename) {
 }
 
 void editorSave() {
-  if (E.filename == NULL)
-    return;
+  if (E.filename == NULL) {
+    E.filename = editorPrompt("Save as: %s");
+
+    if (E.filename == NULL) {
+      editorSetStatusMessage("Save aborted");
+      return;
+    }
+  }
 
   int len;
   char *buf = editorRowsToString(&len);
@@ -556,6 +564,49 @@ void editorSave() {
 }
 
 // --- INPUT ---
+
+char *editorPrompt(char *prompt) {
+  // prompt is expected to be a format string containing a %s user input
+  size_t bufsize = 128;        // user input will be stored in this buf
+  char *buf = malloc(bufsize); // here on buf
+
+  size_t buflen = 0;
+  buf[0] = '\0'; // initialize the buf string to empty string, despite there is
+                 // null char inside
+
+  while (1) {
+    editorSetStatusMessage(prompt, buf);
+    editorRefreshScreen();
+
+    int c = editorReadKey(); // read the key user press after
+    if (c == '\x1b') {
+      editorSetStatusMessage("");
+      free(buf);
+
+      return NULL;
+    } else if (c ==
+               '\r') { // if the key pressed is enter, clear the status message
+      if (buflen != 0) { // and if the buf is not empty
+        editorSetStatusMessage("");
+        return buf;
+      }
+    } else if (!iscntrl(c) && c < 128) { // if c is not a control or special key
+                                         // (key id is less than 128)
+      if (buflen == bufsize - 1) { // if the buflen reached the maximum capacity
+        bufsize *= 2;              // double the size of the bufsize
+        buf = realloc(buf, bufsize); // and reallocate them
+      }
+
+      buf[buflen++] = c;
+      buf[buflen] = '\0';
+    } else if (c == BACKSPACE || c == DEL_KEY || c == CTRL_KEY('h')) {
+      // when the key pressed is the bs, del, or ctrl-h
+
+      if (buflen != 0)
+        buf[--buflen] = '\0';
+    }
+  }
+}
 
 void editorMoveCursor(int key) {
   erow *row = (E.cy >= E.numrows) ? NULL : &E.row[E.cy];
